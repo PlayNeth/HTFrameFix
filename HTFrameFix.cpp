@@ -1,5 +1,6 @@
-// HTFrameFix.asi  v0.2
-// Frame-rate unlock with interpolation, and widescreen, for Hydro Thunder (PC, Eurocom 2000)
+// HTFrameFix.asi  v1.0.0
+// Frame-rate unlock with interpolation, widescreen, arcade sound and arcade
+// settings for Hydro Thunder (PC, Eurocom 2000)
 //
 // Analysed exe: Hydro.exe SHA-1 745cd3cf9aa0327fb5454a7763ff5f91bed9e3ed
 // (PE timestamp 0x38EB1E5C, image base 0x400000, no ASLR). Every patch site is
@@ -52,12 +53,16 @@
 //
 // widescreen=1: the Direct3D renderer runs at any resolution; see the
 // Widescreen section.
+// arcadeSound=1 with HTArcade.pak: the arcade's sounds, music and engines; see
+// the Arcade sound section. trackDifficulty / aiDifficulty / arcadeSpeedway /
+// arcadeLakePowell: see Game settings left from the arcade.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
 #include <ddraw.h>
 #include <d3dtypes.h>
+#include <dsound.h>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -65,7 +70,7 @@
 #include <cstring>
 
 
-#define HTFF_VERSION "0.2"
+#define HTFF_VERSION "1.0.0"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -215,6 +220,13 @@ struct Config {
     int   wsFixFOV = 1;          // 1 = Hor+ 3D view; 0 = stretched
     int   wsHud = 1;             // 1 = 4:3 at the screen edges, 2 = 4:3 in the middle, 0 = stretched
     int   wsMenus = 1;           // 1 = 4:3 in the middle, 2 = stretched
+    // sound
+    int   arcadeSound = 1;       // 1 = sounds and music from HTArcade.pak when it is there
+    // game
+    int   trackDifficulty[13] = {};   // 1-100 (arcade operator setting); 0 = the game's (40)
+    int   aiDifficulty[13] = {};      // 1-100; 0 = the game's (50)
+    int   arcadeSpeedway = 0;    // 1 = the arcade's Hydro Speedway (left in the PC data, unused)
+    int   arcadeLakePowell = 0;  // 1 = the arcade's Lake Powell
 };
 static Config g_cfg;
 static char g_asiDir[MAX_PATH] = {};
@@ -246,7 +258,7 @@ static const char kIniText[] =
     "logToFile=1\n";
 
 static const char kWsBlock[] =
-    "; --- widescreen (v0.2, Direct3D renderer) ---\n"
+    "; --- widescreen (Direct3D renderer) ---\n"
     "; 1 = the game runs at the resolution below instead of 640x480, at any aspect ratio;\n"
     ";   0 = the original 640x480\n"
     "widescreen=1\n"
@@ -260,14 +272,50 @@ static const char kWsBlock[] =
     "; 1 = menus 4:3 in the middle; 2 = stretched\n"
     "wsMenus=1\n";
 
+static const char kArcadeBlock[] =
+    "; --- arcade sound ---\n"
+    "; 1 = the arcade version's sounds and music (31250 Hz, from HTArcade.pak next to the ASI,\n"
+    ";   built by HTArcadePak from the arcade hard disk) replace the PC's 11 kHz ones; 0 = PC sounds\n"
+    "arcadeSound=1\n";
+
+static const char kGameBlock[] =
+    "; --- arcade settings and tracks ---\n"
+    "; the arcade's operator difficulty settings, which the PC version keeps but has no menu for.\n"
+    "; trackDifficulty: how much time the checkpoints give, 1 = most time, 100 = least; the game\n"
+    ";   uses 40. aiDifficulty: how hard the other boats race, 1-100; the game uses 50.\n"
+    "; one number for every track, or 13 separated by commas, in this order: Ship Graveyard, Lost\n"
+    ";   Island, Venice Canals, Lake Powell, Arctic Circle, Nile Adventure, New York Disaster,\n"
+    ";   Greek Isles, Far East, Catacomb, Thunder Park, Hydro Speedway, Castle Von Dandy.\n"
+    "; 0 = the game's\n"
+    "trackDifficulty=0\n"
+    "aiDifficulty=0\n"
+    "; 1 = race the arcade version of Hydro Speedway / Lake Powell instead of the PC's reworked one\n"
+    ";   (the PC data still has them, unused)\n"
+    "arcadeSpeedway=0\n"
+    "arcadeLakePowell=0\n";
+
+static void ParseList(const char* v, int* out, int n) {           // "40" or "40,45,..."
+    int i = 0, last = 0;
+    while (*v && i < n) {
+        last = atoi(v); out[i++] = last;
+        const char* c = strchr(v, ','); if (!c) break;
+        v = c + 1;
+    }
+    if (i == 1) for (; i < n; i++) out[i] = last;
+}
+
 static void LoadConfig() {
     char path[MAX_PATH]; snprintf(path, sizeof(path), "%sHTFrameFix.ini", g_asiDir);
     FILE* f = fopen(path, "r");
     if (!f) {
-        if ((f = fopen(path, "w"))) { fputs(kIniText, f); fputs("\n", f); fputs(kWsBlock, f); fclose(f); }
+        if ((f = fopen(path, "w"))) {
+            fputs(kIniText, f); fputs("\n", f); fputs(kWsBlock, f);
+            fputs("\n", f); fputs(kArcadeBlock, f);
+            fputs("\n", f); fputs(kGameBlock, f); fclose(f);
+        }
         return;
     }
-    bool sawWs = false;
+    bool sawWs = false, sawArcade = false, sawGame = false;
     char line[MAX_PATH + 64];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
@@ -293,10 +341,20 @@ static void LoadConfig() {
         else if (!_stricmp(key, "wsFixFOV"))     g_cfg.wsFixFOV = n;
         else if (!_stricmp(key, "wsHud"))        g_cfg.wsHud = n;
         else if (!_stricmp(key, "wsMenus"))      g_cfg.wsMenus = n;
+        else if (!_stricmp(key, "arcadeSound"))  { g_cfg.arcadeSound = n; sawArcade = true; }
+        else if (!_stricmp(key, "trackDifficulty")) { ParseList(val, g_cfg.trackDifficulty, 13); sawGame = true; }
+        else if (!_stricmp(key, "aiDifficulty")) ParseList(val, g_cfg.aiDifficulty, 13);
+        else if (!_stricmp(key, "arcadeSpeedway")) g_cfg.arcadeSpeedway = n;
+        else if (!_stricmp(key, "arcadeLakePowell")) g_cfg.arcadeLakePowell = n;
     }
     fclose(f);
-    if (!sawWs) {                                                  // an ini from 0.1: add the new settings
-        if (FILE* a = fopen(path, "a")) { fputs("\n", a); fputs(kWsBlock, a); fclose(a); }
+    if (!sawWs || !sawArcade || !sawGame) {                       // an older ini: add the new settings
+        if (FILE* a = fopen(path, "a")) {
+            if (!sawWs) { fputs("\n", a); fputs(kWsBlock, a); }
+            if (!sawArcade) { fputs("\n", a); fputs(kArcadeBlock, a); }
+            if (!sawGame) { fputs("\n", a); fputs(kGameBlock, a); }
+            fclose(a);
+        }
     }
 }
 
@@ -340,7 +398,7 @@ static bool SigsMatch(const ht::Sig* sigs, size_t n) {
         const ht::Sig& s = sigs[i];
         if (IsBadReadPtr(reinterpret_cast<void*>(s.addr), s.len) ||
             memcmp(reinterpret_cast<void*>(s.addr), s.bytes, s.len) != 0) {
-            Logf("exe check: bytes at 0x%06lX differ - not the analysed Hydro.exe, mod off\n", s.addr);
+            Logf("exe check: bytes at 0x%06lX differ from the analysed Hydro.exe\n", s.addr);
             return false;
         }
     }
@@ -348,7 +406,10 @@ static bool SigsMatch(const ht::Sig* sigs, size_t n) {
 }
 static bool CheckSigs() {
     if (!SigsMatch(ht::kSigs, sizeof(ht::kSigs) / sizeof(ht::kSigs[0])) ||
-        !SigsMatch(ht::kStampSites, sizeof(ht::kStampSites) / sizeof(ht::kStampSites[0]))) return false;
+        !SigsMatch(ht::kStampSites, sizeof(ht::kStampSites) / sizeof(ht::kStampSites[0]))) {
+        Logf("exe check: not the analysed Hydro.exe - mod off\n");
+        return false;
+    }
     Logf("exe check: Hydro.exe matches\n");
     return true;
 }
@@ -1886,6 +1947,288 @@ static void Install() {
          g_blendObjects ? "" : ", camera only");
 }
 
+// ---------------------------------------------------------------------------
+// Arcade sound
+// ---------------------------------------------------------------------------
+// The PC version's sounds are the arcade's, brought down to 11025 Hz 4-bit
+// ADPCM. HTArcade.pak holds the arcade's own (16-bit, 31250 Hz, from the
+// arcade hard disk's decoded sound caches), each keyed by where the PC sound
+// it replaces sits in Hydro.fsd. Built by tools/HTArcadePak.
+//   effects: "h:\sound\N.esf" is opened (0x46ED90) and read whole (0x46EF60)
+//     into a DirectSound buffer made by 0x47C3F0, which only takes 11025 or
+//     22050 Hz (patched to take any rate). Pitch changes (0x47CB80) set an
+//     absolute frequency made for 11025 Hz sounds; it is scaled for these.
+//   music: a thread streams "track%02d.esf" through a 2-second buffer, one
+//     1-second half at a time (0x46AFC0, decoding the ADPCM read in by
+//     0x46AE90). The buffer is made 31250 Hz (2 x 1 s) and the half refill
+//     replaced: arcade tracks are played (looped seamlessly), the others are
+//     decoded as before and resampled.
+namespace snd {
+struct PakEnt { DWORD fsdOff, rate, samples, flags, dataOff; };   // flags: 1 music, 2 looped effect
+enum : DWORD { kMusic = 1 };
+static const BYTE* g_pak = nullptr;
+static DWORD g_nEnts = 0;
+static const PakEnt* g_ents = nullptr;
+
+static const PakEnt* Find(DWORD off) {
+    if (!off) return nullptr;
+    DWORD lo = 0, hi = g_nEnts;
+    while (lo < hi) {
+        DWORD mid = (lo + hi) / 2;
+        if (g_ents[mid].fsdOff < off) lo = mid + 1; else hi = mid;
+    }
+    return lo < g_nEnts && g_ents[lo].fsdOff == off ? &g_ents[lo] : nullptr;
+}
+static inline const short* Pcm(const PakEnt* e) { return reinterpret_cast<const short*>(g_pak + e->dataOff); }
+
+// archive handle -> offset of the file in Hydro.fsd (0 = loose files / bad handle)
+static DWORD FsdOffset(DWORD h) {
+    if (!G<DWORD>(0x68F4AC) || h < 1 || h > 0x800) return 0;
+    return G<DWORD>(0x6674A8 + (h - 1) * 16);
+}
+
+static bool LoadPak(const char* path) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(f, nullptr);
+    HANDLE m = size > 12 ? CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    CloseHandle(f);
+    if (!m) return false;
+    const BYTE* p = static_cast<const BYTE*>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0));
+    CloseHandle(m);
+    if (!p) return false;
+    DWORD n = *reinterpret_cast<const DWORD*>(p + 8);
+    bool ok = !memcmp(p, "HTAP", 4) && *reinterpret_cast<const DWORD*>(p + 4) == 1 && n && n < 0x10000 && 12 + n * 20 <= size;
+    const PakEnt* e = reinterpret_cast<const PakEnt*>(p + 12);
+    for (DWORD i = 0; ok && i < n; i++)
+        ok = e[i].rate >= 4000 && e[i].rate <= 96000 && e[i].samples && e[i].samples < 0x4000000 &&
+             e[i].dataOff >= 12 + n * 20 && e[i].dataOff <= size && e[i].samples * 2 <= size - e[i].dataOff &&
+             !(e[i].dataOff & 1) && (i == 0 || e[i - 1].fsdOff < e[i].fsdOff);
+    if (!ok) { UnmapViewOfFile(p); return false; }
+    g_pak = p; g_ents = e; g_nEnts = n;
+    return true;
+}
+
+// ---- effects
+static const PakEnt* g_esf = nullptr;      // the replacement for the ESF open now (main thread)
+static float g_ratio[0x400];               // per sound id: replacement rate / the PC sound's rate; 0 = PC sound
+static BYTE* g_esfOpenTramp = nullptr;
+typedef DWORD (__fastcall *EsfOpenFn)(const char*, int*, int*, int*);
+
+static int SoundId(const char* name) {                             // "h:\sound\123.esf" -> 123
+    if (!name) return -1;
+    const char* s = strrchr(name, '\\'); s = s ? s + 1 : name;
+    if (*s < '0' || *s > '9') return -1;
+    int id = atoi(s);
+    return id >= 0 && id < 0x400 ? id : -1;
+}
+static DWORD __fastcall EsfOpenHook(const char* name, int* bits, int* rate, int* loop) {
+    DWORD size = reinterpret_cast<EsfOpenFn>(g_esfOpenTramp)(name, bits, rate, loop);
+    const PakEnt* e = Find(FsdOffset(G<DWORD>(0x665010)));
+    if (e && (e->flags & kMusic)) e = nullptr;
+    int id = SoundId(name);
+    if (id >= 0) g_ratio[id] = 0.0f;
+    g_esf = e;
+    if (!e) return size;
+    int orig = rate && *rate > 0 ? *rate : 11025;
+    if (bits) *bits = 16;
+    if (rate) *rate = (int)e->rate;
+    if (id >= 0) g_ratio[id] = (float)e->rate / (float)orig;
+    return e->samples * 2;
+}
+static void __fastcall EsfReadAllHook(BYTE* dst) {
+    if (g_esf) { memcpy(dst, Pcm(g_esf), g_esf->samples * 2); return; }
+    reinterpret_cast<void (__fastcall*)(BYTE*, DWORD)>(0x46EE70)(dst, G<DWORD>(0x66500C) & 0x0FFFFFFF);
+}
+static void EsfCloseHook() {
+    g_esf = nullptr;
+    DWORD h = G<DWORD>(0x665010);
+    if (h) reinterpret_cast<DWORD (__fastcall*)(DWORD)>(0x470A10)(h);
+    G<DWORD>(0x665010) = 0;
+}
+// 0x47CB80 (cl = channel, edx = Hz), as the game's, with the frequency scaled for a replaced sound
+static void __fastcall SetFreqHook(DWORD chReg, DWORD freq) {
+    BYTE ch = (BYTE)chReg;
+    if (ch >= 0x10) return;
+    short id = G<short>(0x13C1958 + ch * 4);
+    if (id == -1 || !G<DWORD>(0x13B6958 + id * 44)) return;
+    int idx = G<short>(0x13C195A + ch * 4) + id * 11;
+    IDirectSoundBuffer* b = G<IDirectSoundBuffer*>(0x13B6958 + idx * 4);
+    if (!b) return;
+    if (id >= 0 && id < 0x400 && g_ratio[id] > 0.0f) {
+        float f = (float)freq * g_ratio[id];
+        freq = f > (float)DSBFREQUENCY_MAX ? DSBFREQUENCY_MAX : (DWORD)(f + 0.5f);
+    }
+    G<HRESULT>(0x13C19D0) = b->SetFrequency(freq);
+}
+
+// ---- music
+enum : DWORD { kMRate = 31250, kMHalf = kMRate * 2, kMBuf = kMHalf * 2 };   // bytes: 1 s halves, 16-bit mono
+static const PakEnt* g_track = nullptr;    // the arcade track playing (music thread)
+static short g_pcm[11025];                  // one PC half (1 s at 11025 Hz)
+static short g_prevLast = 0;
+typedef void (__fastcall *AdpcmFn)(const BYTE*, short*, DWORD, DWORD*);
+
+static void FillHalf(short* out, DWORD cnt) {
+    if (g_track) {                                                 // arcade track: looped seamlessly
+        const short* s = Pcm(g_track);
+        DWORD len = g_track->samples, t = (DWORD)(((unsigned long long)cnt * kMRate) % len);
+        for (DWORD i = 0; i < kMRate; i++) { out[i] = s[t]; if (++t == len) t = 0; }
+        return;
+    }
+    DWORD n = G<DWORD>(0x6344EC), idx = n ? cnt % n : 0, rem = G<DWORD>(0x6344F4) % 22050, bytes = 22050;
+    if (idx == n - 1 && rem) { memset(g_pcm, 0, sizeof(g_pcm)); bytes = rem; }
+    reinterpret_cast<AdpcmFn>(0x46A6B0)(reinterpret_cast<const BYTE*>(0x5916F8 + ((idx * 22050) >> 2)), g_pcm, bytes,
+                                       reinterpret_cast<DWORD*>(0x6344F8));
+    if (idx == n - 1) G<DWORD>(0x6344F8) = 0;
+    if (idx == 0) g_prevLast = g_pcm[0];
+    // 11025 -> 31250: output j sits at input j * 441 / 1250; sample -1 is the last half's last one
+    for (DWORD j = 0; j < kMRate; j++) {
+        DWORD num = j * 441, k = num / 1250, fr = num % 1250;
+        int a = k ? g_pcm[k - 1] : g_prevLast, b = g_pcm[k < 11025 ? k : 11024];
+        // position k - 1 + fr/1250 between samples k-1 and k (keeps the first output on the last input)
+        out[j] = (short)(a + (b - a) * (int)fr / 1250);
+    }
+    g_prevLast = g_pcm[11024];
+}
+
+// replaces 0x46AFC0 (the music thread's refill); the game's logic, at 31250 Hz
+static void MusicRefill() {
+    if (!G<DWORD>(0x6344DC)) return;
+    IDirectSoundBuffer* b = G<IDirectSoundBuffer*>(0x6344C8);
+    DWORD cnt = G<DWORD>(0x634508), read = G<DWORD>(0x634504), n = G<DWORD>(0x6344EC);
+    if (!n || (read < n && cnt >= read)) return;                   // its chunk is not read in yet
+    if (cnt > 0) {
+        DWORD play = 0, write = 0;
+        if (b) b->GetCurrentPosition(&play, &write);
+        if (play / kMHalf != ((cnt - 1) & 1)) return;              // still playing the other half
+    } else {
+        const PakEnt* e = Find(FsdOffset(G<DWORD>(0x6344FC)));
+        g_track = e && (e->flags & kMusic) ? e : nullptr;
+        g_prevLast = 0;
+    }
+    if (!G<DWORD>(0x6344F0) && cnt >= n) { reinterpret_cast<void (*)()>(0x46AC30)(); return; }
+    if (!b) { G<DWORD>(0x634508) = cnt + 1; return; }
+    DWORD status = 0;
+    b->GetStatus(&status);
+    void *p1, *p2; DWORD l1, l2;
+    if (status & DSBSTATUS_BUFFERLOST) {
+        b->Restore();
+        if (SUCCEEDED(b->Lock(0, kMBuf, &p1, &l1, &p2, &l2, 0))) {
+            if (p1) memset(p1, 0, l1);
+            b->Unlock(p1, l1, p2, l2);
+        }
+    }
+    if (SUCCEEDED(b->Lock((cnt & 1) * kMHalf, kMHalf, &p1, &l1, &p2, &l2, 0))) {
+        if (p1 && l1 == kMHalf) FillHalf(static_cast<short*>(p1), cnt);
+        b->Unlock(p1, l1, p2, l2);
+    }
+    if (cnt == 0) { b->SetCurrentPosition(0); b->Play(0, 0, DSBPLAY_LOOPING); }
+    G<DWORD>(0x634508) = cnt + 1;
+}
+}  // namespace snd
+
+// The game also sets DirectSound's primary buffer, the format everything is
+// mixed into, to 11025 Hz (0x47CDCC, SetFormat). Windows' own DirectSound
+// ignores that, but Wine and DirectSound replacements mix at it, which would
+// bring the arcade sounds back down to 11 kHz: with the pack, it is 44100 Hz.
+static const ht::Sig kPrimarySigs[] = {
+    { 0x47CDE4, "\xC7\x44\x24\x14\x11\x2B\x00\x00", 8 },   // nSamplesPerSec = 11025
+    { 0x47CDFA, "\xC7\x44\x24\x18\x44\xAC\x00\x00", 8 },   // nAvgBytesPerSec = 44100 (11025 * 4)
+};
+static const ht::Sig kArcadeSigs[] = {
+    { 0x46ED90, "\x56\x57\x8B\xFA\x8B\xF1\xE8", 7 },               // EsfOpen
+    { 0x46EF60, "\x8B\x15\x0C\x50\x66\x00\x81\xE2\xFF\xFF\xFF\x0F\xE9", 13 },   // EsfReadAll
+    { 0x46EF80, "\x8B\x0D\x10\x50\x66\x00\x85\xC9\x74\x05\xE8", 11 },  // EsfClose
+    { 0x47CB80, "\x80\xF9\x10\x56\x73\x4F", 6 },                   // SetFrequency
+    { 0x47C42C, "\x3D\x22\x56\x00\x00\x74\x05\xB8\x11\x2B\x00\x00", 12 },   // rate: 22050 or 11025
+    { 0x47C460, "\x33\xC9\x3D\x11\x2B\x00\x00\x0F\x95\xC1\x33\xC0\x66\x89\x7C\x24\x28\x8D\x7C\x24\x2C"
+                "\x49\x81\xE1\xEF\xD4\xFF\xFF\x81\xC1\x22\x56\x00\x00", 34 },
+    { 0x46AA7A, "\x68\x11\x2B\x00\x00\xBA\x10\x00\x00\x00\xB9\x44\xAC\x00\x00", 15 },   // music buffer
+    { 0x46AFC0, "\x83\xEC\x14\xA1\xDC\x44\x63\x00", 8 },           // music refill
+    { 0x46A7F5, "\xC2\x08\x00", 3 },                               // ADPCM decoder: fastcall, 2 stack args
+};
+static void InstallArcadeSound() {
+    if (!g_cfg.arcadeSound) { Logf("arcade sound: off (arcadeSound=0)\n"); return; }
+    char path[MAX_PATH]; snprintf(path, sizeof(path), "%sHTArcade.pak", g_asiDir);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) { Logf("arcade sound: no HTArcade.pak, PC sounds\n"); return; }
+    if (!SigsMatch(kArcadeSigs, sizeof(kArcadeSigs) / sizeof(kArcadeSigs[0]))) { Logf("arcade sound: off\n"); return; }
+    if (!snd::LoadPak(path)) { Logf("arcade sound: HTArcade.pak is not valid, PC sounds\n"); return; }
+    BYTE* t = static_cast<BYTE*>(VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!t) return;
+    memcpy(t, "\x56\x57\x8B\xFA\x8B\xF1\xE9", 7);                 // EsfOpen's first 6 bytes, then on to 0x46ED96
+    DWORD rel = 0x46ED96 - (reinterpret_cast<DWORD>(t) + 11); memcpy(t + 7, &rel, 4);
+    snd::g_esfOpenTramp = t;
+    static const BYTE anyRate[] = { 0xEB };                        // 0x47C431: je -> jmp (keep the rate)
+    static const BYTE rateFmt[34] = { 0x8B, 0xC8, 0x33, 0xC0, 0x66, 0x89, 0x7C, 0x24, 0x28, 0x8D, 0x7C, 0x24, 0x2C,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    DWORD mRate = snd::kMRate, mBuf = snd::kMBuf;
+    unsigned music = 0;
+    for (DWORD i = 0; i < snd::g_nEnts; i++) music += (snd::g_ents[i].flags & snd::kMusic) ? 1 : 0;
+    bool ok = PatchBytes(0x47C431, anyRate, 1) && PatchBytes(0x47C460, rateFmt, 34) &&   // ecx = rate
+              PatchJmp(0x46ED90, reinterpret_cast<void*>(&snd::EsfOpenHook), 6) &&
+              PatchJmp(0x46EF60, reinterpret_cast<void*>(&snd::EsfReadAllHook), 6) &&
+              PatchJmp(0x46EF80, reinterpret_cast<void*>(&snd::EsfCloseHook), 6) &&
+              PatchJmp(0x47CB80, reinterpret_cast<void*>(&snd::SetFreqHook), 6) &&
+              PatchBytes(0x46AA7A + 1, &mRate, 4) && PatchBytes(0x46AA84 + 1, &mBuf, 4) &&
+              PatchJmp(0x46AFC0, reinterpret_cast<void*>(&snd::MusicRefill), 8);
+    Logf("arcade sound: %s - HTArcade.pak, %lu sounds (%u music tracks)\n", ok ? "on" : "patch failed",
+         snd::g_nEnts, music);
+    DWORD r = 44100, bytes = 44100 * 4;
+    if (ok && SigsMatch(kPrimarySigs, sizeof(kPrimarySigs) / sizeof(kPrimarySigs[0])) &&
+        PatchBytes(0x47CDE4 + 4, &r, 4) && PatchBytes(0x47CDFA + 4, &bytes, 4))
+        Logf("arcade sound: mixed at 44100 Hz (the game asks for 11025)\n");
+}
+
+
+// ---------------------------------------------------------------------------
+// Game settings left from the arcade
+// ---------------------------------------------------------------------------
+// The PC version keeps the arcade's operator settings (0x1455420, loaded from
+// Hydro.cfg at start-up by 0x428EC0) without the operator menu: a track
+// difficulty per track (+0x50, the checkpoint times: 0x451B60 picks them from a
+// table, 0 = most time, 99 = least) and an AI difficulty per track (+0x84). The
+// AI's are put back to 50 on every start, the track ones stay at 40. Both are
+// set from the ini once the settings are loaded.
+// The PC data also still has the arcade's own Hydro Speedway and Lake Powell
+// (HETXTR2 / HFTXTR3, with their own skies and water); the PC's track table
+// points at reworked ones. Their slots can be pointed back.
+static void ApplyDifficulty() {
+    for (int t = 0; t < 13; t++) {
+        int d = g_cfg.trackDifficulty[t], a = g_cfg.aiDifficulty[t];
+        if (d > 0) G<int>(0x1455470 + t * 4) = (d > 100 ? 100 : d) - 1;
+        if (a > 0) G<int>(0x14554A4 + t * 4) = a > 100 ? 100 : a;
+    }
+}
+// replaces the call at 0x428ED4 (to 0x402910, a bare ret) at the end of the settings' load
+static const char kXtr2[] = "HETXTR2TRH0", kXtr3[] = "HFTXTR3TRH0";
+static const ht::Sig kGameSigs[] = {
+    { 0x428ED4, "\xE8\x37\x9A\xFD\xFF\xB8\x01\x00\x00\x00", 10 },   // operator settings loaded: call 0x402910
+    { 0x402910, "\xC3", 1 },                                         //   (ret)
+    { 0x43C8FF, "\x8B\x04\x85\x70\x54\x45\x01", 7 },                // track difficulty read
+    { 0x4EF69C, "\xD8\xF8\x4E\x00", 4 },                            // Hydro Speedway's track file
+    { 0x4EEE3C, "\x10\xFA\x4E\x00", 4 },                            // Lake Powell's
+    { 0x4EF8D8, "HZTLOO2TRH0", 11 },
+    { 0x4EFA10, "HPTPWELTRH0", 11 },
+};
+static void InstallGame() {
+    bool diff = false;
+    for (int t = 0; t < 13; t++) diff |= g_cfg.trackDifficulty[t] > 0 || g_cfg.aiDifficulty[t] > 0;
+    if (!diff && !g_cfg.arcadeSpeedway && !g_cfg.arcadeLakePowell) return;
+    if (!SigsMatch(kGameSigs, sizeof(kGameSigs) / sizeof(kGameSigs[0]))) { Logf("arcade settings and tracks: off\n"); return; }
+    if (diff && PatchCall(0x428ED4, reinterpret_cast<void*>(&ApplyDifficulty), 5)) {
+        char a[80] = "", b[80] = "";
+        for (int t = 0; t < 13; t++) {
+            snprintf(a + strlen(a), sizeof(a) - strlen(a), "%s%d", t ? "," : "", g_cfg.trackDifficulty[t]);
+            snprintf(b + strlen(b), sizeof(b) - strlen(b), "%s%d", t ? "," : "", g_cfg.aiDifficulty[t]);
+        }
+        Logf("difficulty: tracks %s, AI %s (0 = the game's)\n", a, b);
+    }
+    DWORD p2 = reinterpret_cast<DWORD>(kXtr2), p3 = reinterpret_cast<DWORD>(kXtr3);
+    if (g_cfg.arcadeSpeedway && PatchBytes(0x4EF69C, &p2, 4)) Logf("Hydro Speedway: the arcade's\n");
+    if (g_cfg.arcadeLakePowell && PatchBytes(0x4EEE3C, &p3, 4)) Logf("Lake Powell: the arcade's\n");
+}
+
 // A crash in the game is logged (the first few), with what the mod was doing.
 static LONG CALLBACK CrashLog(EXCEPTION_POINTERS* e) {
     static int logged = 0;
@@ -1927,10 +2270,13 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         g_log = fopen(path, "w");
     }
     Logf("HTFrameFix v" HTFF_VERSION "\n");
-    if (g_log) AddVectoredExceptionHandler(0, CrashLog);
     if (!CheckSigs()) return TRUE;
+    // (Only on the analysed exe: the crash log reads the game's globals.)
+    if (g_log) AddVectoredExceptionHandler(0, CrashLog);
     Install();
     InstallWidescreen();
+    InstallArcadeSound();
+    InstallGame();
     if (g_active || g_wsOn) {
         if (PatchJmp(ws::glows, reinterpret_cast<void*>(&WsGlowStub), 5))
             Logf("light glows: %s\n", g_active ? "blended with the camera" : "widescreen only");
