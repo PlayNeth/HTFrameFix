@@ -1,5 +1,5 @@
-// HTFrameFix.asi  v0.1
-// Frame-rate unlock with interpolation for Hydro Thunder (PC, Eurocom 2000)
+// HTFrameFix.asi  v0.2
+// Frame-rate unlock with interpolation, and widescreen, for Hydro Thunder (PC, Eurocom 2000)
 //
 // Analysed exe: Hydro.exe SHA-1 745cd3cf9aa0327fb5454a7763ff5f91bed9e3ed
 // (PE timestamp 0x38EB1E5C, image base 0x400000, no ASLR). Every patch site is
@@ -49,10 +49,15 @@
 //    draw per tick.
 //  - In-between frames are drawn only in races; menus, the pause screen and
 //    the options keep 30 fps.
+//
+// widescreen=1: the Direct3D renderer runs at any resolution; see the
+// Widescreen section.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#include <ddraw.h>
+#include <d3dtypes.h>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -60,7 +65,7 @@
 #include <cstring>
 
 
-#define HTFF_VERSION "0.1"
+#define HTFF_VERSION "0.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -156,6 +161,8 @@ namespace ht {
         { drawRace,     "\x83\xEC\x10\x33\xC9\xE8\x46\xE5", 8 },
         { 0x44C05F,     "\xB9\xC0\xC9\x44\x00", 5 },                     // mov ecx, 0x44C9C0 (race draw)
         { 0x42F940,     "\x83\xEC\x08\xA1\x9C\x49\x45\x01", 8 },         // tick counter advance
+        { 0x409760,     "\xA1\xE0\x63\x4F\x00", 5 },                     // light glows: mov eax, [0x4F63E0]
+        { 0x44D120,     "\x51\xA1\x10\x80\x55\x00\x85\xC0", 8 },     // sky angles (called again, not patched)
         { 0x42F70F,     "\xA1\x70\xE2\x51\x00", 5 },                     // mov eax, [0x51E270] (pending draw)
         { 0x42F720,     "\xA3\xBC\x49\x45\x01", 5 },                     // mov [0x14549BC], eax
         { 0x408BC1,     "\xE8\xFA\x08\x06\x00", 5 },                     // keyframe pushes (call 0x4694C0)
@@ -201,6 +208,13 @@ struct Config {
     float maxMove = 100.0f;      // world units per tick; more = a jump (or another object), not blended
     float maxTurn = 50.0f;       // degrees per tick; more = not blended
     int   logToFile = 1;
+    // widescreen (Direct3D renderer)
+    int   widescreen = 1;
+    int   wsWidth = 0;           // 0 = the desktop's resolution
+    int   wsHeight = 0;
+    int   wsFixFOV = 1;          // 1 = Hor+ 3D view; 0 = stretched
+    int   wsHud = 1;             // 1 = 4:3 at the screen edges, 2 = 4:3 in the middle, 0 = stretched
+    int   wsMenus = 1;           // 1 = 4:3 in the middle, 2 = stretched
 };
 static Config g_cfg;
 static char g_asiDir[MAX_PATH] = {};
@@ -231,13 +245,29 @@ static const char kIniText[] =
     "; write HTFrameFix.log next to the ASI\n"
     "logToFile=1\n";
 
+static const char kWsBlock[] =
+    "; --- widescreen (v0.2, Direct3D renderer) ---\n"
+    "; 1 = the game runs at the resolution below instead of 640x480, at any aspect ratio;\n"
+    ";   0 = the original 640x480\n"
+    "widescreen=1\n"
+    "; resolution; 0 = the desktop's\n"
+    "wsWidth=0\n"
+    "wsHeight=0\n"
+    "; 1 = Hor+ 3D view (the 4:3 vertical view stays, you see more at the sides); 0 = stretched\n"
+    "wsFixFOV=1\n"
+    "; 1 = 4:3 HUD, its elements at the screen edges; 2 = 4:3 HUD in the middle; 0 = stretched\n"
+    "wsHud=1\n"
+    "; 1 = menus 4:3 in the middle; 2 = stretched\n"
+    "wsMenus=1\n";
+
 static void LoadConfig() {
     char path[MAX_PATH]; snprintf(path, sizeof(path), "%sHTFrameFix.ini", g_asiDir);
     FILE* f = fopen(path, "r");
     if (!f) {
-        if ((f = fopen(path, "w"))) { fputs(kIniText, f); fclose(f); }
+        if ((f = fopen(path, "w"))) { fputs(kIniText, f); fputs("\n", f); fputs(kWsBlock, f); fclose(f); }
         return;
     }
+    bool sawWs = false;
     char line[MAX_PATH + 64];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
@@ -257,8 +287,17 @@ static void LoadConfig() {
         else if (!_stricmp(key, "maxMove"))      { float v = (float)atof(val); if (v > 0.0f) g_cfg.maxMove = v; }
         else if (!_stricmp(key, "maxTurn"))      { float v = (float)atof(val); if (v > 0.0f && v < 90.0f) g_cfg.maxTurn = v; }
         else if (!_stricmp(key, "logToFile"))    g_cfg.logToFile = n;
+        else if (!_stricmp(key, "widescreen"))   { g_cfg.widescreen = n; sawWs = true; }
+        else if (!_stricmp(key, "wsWidth"))      g_cfg.wsWidth = n;
+        else if (!_stricmp(key, "wsHeight"))     g_cfg.wsHeight = n;
+        else if (!_stricmp(key, "wsFixFOV"))     g_cfg.wsFixFOV = n;
+        else if (!_stricmp(key, "wsHud"))        g_cfg.wsHud = n;
+        else if (!_stricmp(key, "wsMenus"))      g_cfg.wsMenus = n;
     }
     fclose(f);
+    if (!sawWs) {                                                  // an ini from 0.1: add the new settings
+        if (FILE* a = fopen(path, "a")) { fputs("\n", a); fputs(kWsBlock, a); fclose(a); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +459,7 @@ static bool  g_blendObjects = true;     // objects blended too, not just the cam
 static bool  g_tableFull = false;       // logged once
 static Mat   g_viewExact;
 static bool  g_viewSaved = false;
+static bool  g_inDisplay = false;       // drawing an in-between (or tick's shown) frame
 
 static void NewTick(DWORD t) {
     bool follows = (g_curTick != 0xFFFFFFFF && t == g_curTick + 1);
@@ -943,6 +983,41 @@ static __attribute__((noinline)) void RunDraw(DWORD fn, DWORD arg, bool blend) {
     if (g_viewSaved) G<Mat>(ht::viewBase) = g_viewExact;          // the tick never sees a blended view
 }
 
+// The sky scrolls with the camera's angles: the camera code (once a tick)
+// calls 0x44D120 (ecx = yaw, edx = pitch, [esp+4] = roll), which keeps them at
+// 0x558050 / 0x558054 / 0x558058 and rebuilds the sky's layers (0x44DB80, or
+// 0x44DFE0 turned by the roll when it isn't 0).
+// A frame shown in between calls it again with the angles blended between the
+// last two ticks; all it changes is in kDrawState, put back after the frame.
+// Yaw: 0x20000 a turn (0x44D15E scales it by 0.5 into 16 bits); roll: 0x10000
+// a turn (0x44DFE0 looks it up in the sine table as it is).
+struct SkyAngles { int yaw, pitch, roll; DWORD tick; bool valid; };
+static SkyAngles g_skyCur = {}, g_skyPrev = {};
+const DWORD kSkySet = 0x44D120;
+static void NoteSkyAngles(DWORD tick) {
+    SkyAngles a = { G<int>(0x558050), G<int>(0x558054), G<int>(0x558058), tick, true };
+    g_skyPrev = (g_skyCur.valid && g_skyCur.tick + 1 == tick) ? g_skyCur : SkyAngles{};
+    g_skyCur = a;
+}
+static inline int AngleDelta(int from, int to, int turn = 0x20000) {
+    int d = (to - from) & (turn - 1);
+    return d >= turn / 2 ? d - turn : d;
+}
+static void BlendSky(float alpha) {
+    if (!g_skyPrev.valid || !g_skyCur.valid || g_skyCur.tick != g_last.count) return;
+    if (!G<DWORD>(0x558010)) return;                               // (no sky)
+    int dy = AngleDelta(g_skyPrev.yaw, g_skyCur.yaw), dp = AngleDelta(g_skyPrev.pitch, g_skyCur.pitch);
+    int dr = AngleDelta(g_skyPrev.roll, g_skyCur.roll, 0x10000);
+    if (!dy && !dp && !dr) return;
+    if (dy > 0x4000 || dy < -0x4000 || dp > 0x4000 || dp < -0x4000 || dr > 0x2000 || dr < -0x2000) {
+        return;                                                    // a camera cut: as it is
+    }
+    int yaw = g_skyPrev.yaw + (int)lroundf(dy * alpha), pitch = g_skyPrev.pitch + (int)lroundf(dp * alpha);
+    int roll = (g_skyPrev.roll + (int)lroundf(dr * alpha)) & 0xFFFF;
+    if (!g_skyCur.roll && !g_skyPrev.roll) roll = 0;
+    reinterpret_cast<void (__attribute__((fastcall)) *)(int, int, int)>(kSkySet)(yaw, pitch, roll);
+}
+
 // The tick's own draw (from 0x42F700).
 extern "C" void DrawHook(DWORD arg) {
     DWORD fn = G<DWORD>(ht::drawFn);
@@ -955,6 +1030,7 @@ extern "C" void DrawHook(DWORD arg) {
     g_last.valid  = true;
     g_drawStamp = g_last.count;                                    // a tick draws with the counter itself
     if (fn == ht::drawRace) {
+        NoteSkyAngles(g_last.count);
         CopyState(g_statePre, true);
         g_preValid = true;
     }
@@ -1010,10 +1086,13 @@ static void DisplayFrame(float alpha, bool tickFrame) {
     // a stamp no tick uses (the counter never reaches bit 31): everything is drawn again
     g_drawStamp = 0x80000000u | (++g_interpSeq & 0x7FFFFFFFu);
     CopyState(g_statePre, false);                                  // the state the tick's draw started from
+    BlendSky(alpha);
     G<DWORD>(ht::warnArmed) = 1;                                   // 0x409390: count from 0, no sound
     G<DWORD>(ht::warnCount) = 0;
     g_alpha = alpha;
+    g_inDisplay = true;
     RunDraw(g_last.fn, g_last.arg, true);
+    g_inDisplay = false;
     CopyState(g_statePost, false);                                 // and the state the tick left
     g_drawStamp = g_last.count;
     if (G<DWORD>(ht::fadeCount)) CallFnC(ht::fnFade, G<DWORD>(ht::fadeArg));
@@ -1090,6 +1169,696 @@ extern "C" void Frame() {
 }
 
 // ---------------------------------------------------------------------------
+// Widescreen (Direct3D renderer)
+// ---------------------------------------------------------------------------
+// The game lays everything out for a 640x480 screen and its Direct3D renderer
+// sets that mode. widescreen runs the renderer at any resolution and remaps
+// the 640x480 picture where every triangle reaches Direct3D: they are written
+// as pretransformed vertices into one buffer (0x636520, slots handed out by
+// 0x46D850) and drawn when it is flushed (0x46CE20). Each triangle is tagged
+// when its slot is handed out with what is drawing it, and moved at the flush:
+//  - 3D (the race draw 0x44C9C0, and the light glows 0x409760 the HUD draws):
+//    scaled by height/480 around the middle. The projection is left as it is,
+//    so the vertical view is the 4:3 one, and the culling it does against the
+//    4:3 screen is widened after the projection setup (0x452530): the clip
+//    rectangle the triangles are culled and clipped against, the frustum's side
+//    planes (rebuilt from tan(h') = k tan(h), h = half the horizontal FOV) and
+//    the half diagonal. The light glows' screen radius reads a wider half
+//    width. That is Hor+.
+//  - The sky (0x44D1E0, a backdrop on a 4:3 screen quad): stretched across
+//    the width, the vertical as the 3D. Its quad can't be widened: it is cut
+//    into 256-unit tiles, one sky layer each, with room for 8 (0x5579F0 -
+//    0x557FB0); a wider quad needs more and overwrites the sky's texture table.
+//  - HUD (0x4316E0, called by the race draw): 4:3 size, each triangle at the
+//    left edge, the middle or the right edge by where it is on the 4:3 screen
+//    (thirds). Text is queued as glyphs (0x450E40, one call a string) and drawn
+//    later (0x451280): a string's glyphs share one anchor, from its extent.
+//  - Menus (everything else): 4:3 in the middle, or stretched.
+//  - The full-screen fade quad (0x47BAC0) covers the whole screen.
+//  - The markers for opponents close behind (the scene draw places them
+//    itself, centred: at the 4:3 edges, x = -/+316.25, or along the bottom)
+//    are moved to the screen's edges and spread as wide.
+// Menu images are copied straight into the locked back buffer (0x416FB0 via
+// 0x46BA40): the lock hands out a 640x480 copy instead, made from the frame,
+// and the unlock scales the pixels the game changed into the frame.
+namespace ws {
+    struct Imm { DWORD addr; int off; bool height; };
+    const Imm kImm[] = {                       // 640 / 480 immediates of the Direct3D renderer
+        { 0x46CFA2, 1, true  }, { 0x46CFA7, 1, false },   // window size (0x46D0B0)
+        { 0x46CFDF, 1, true  }, { 0x46CFE4, 1, false },   // SetDisplayMode
+        { 0x46CFF8, 1, true  }, { 0x46CFFD, 1, false },   // window size
+        { 0x46D035, 4, false }, { 0x46D03F, 4, true  },   // GetDisplayMode check
+        { 0x46D5B9, 4, false }, { 0x46D5C1, 4, true  },   // Z buffer
+        { 0x46D804, 4, false }, { 0x46D80C, 4, true  },   // viewport
+    };
+    // reads of the half screen width (320.5, [0x14508D8]) by the light glows
+    // (their screen radius); the address is the last 4 bytes
+    const DWORD kHalfWReads[] = { 0x4097B7, 0x4097C2 };
+    // The markers for opponents close behind (drawn by the scene draw 0x4174A0,
+    // two loops): at the left or right edge (push x = -/+316.25, centred on
+    // the screen) or along the bottom (x = offset * [0x48B404] (245) * 1.25)
+    const DWORD kMarkerEdges[] = { 0x41783B, 0x417888, 0x417A6B, 0x417AA2 };   // push imm32: -, +, -, +
+    const DWORD kMarkerSpread[] = { 0x4178B9, 0x417AB2 };                      // fmul [0x48B404]: address at +2
+
+    const DWORD tagSlot    = 0x46D89F;   // 0x46D850's "lea eax, [eax+0x6364C0] / ret": a triangle's slot
+    const DWORD flush      = 0x46CE20;   // draws the triangle buffer
+    const DWORD projEnd    = 0x4528AF;   // 0x452530's "add esp, 0x14 / ret 4"
+    const DWORD raceDraw   = 0x44C9C0;
+    const DWORD callHud    = 0x44CB1B;   // call 0x4316E0
+    const DWORD callLast   = 0x44CB20;   // call 0x4352D0 (draws nothing), then the race draw returns
+    const DWORD glows      = 0x409760;
+    const DWORD callSky    = 0x44CACF;   // the race draw's call 0x44D1E0
+    const DWORD glyphQuad  = 0x4513B2;   // call 0x47B7F0 for one glyph (esi = its record + 0x24)
+    const DWORD glyphDraw  = 0x451280;   // ecx = first glyph record, edx = count
+    const DWORD strQueue   = 0x450E40;   // queue a string's glyphs (or draw them at once)
+    const DWORD fadeQuad   = 0x47BB59;   // call 0x47B7F0, 640x480
+    const DWORD lockBB     = 0x46BA40;   // lock the back buffer for direct writes
+    const DWORD unlockBB   = 0x46BB50;
+    const DWORD isD3D      = 0x471FC0;   // 1 = the Direct3D renderer
+    const DWORD callBegin  = 0x4780B1;   // 0x478080: call 0x46CDA0 (BeginScene)
+    const DWORD callFlip   = 0x478040;   // 0x478040: call 0x472050 (flip)
+    const DWORD device     = 0x63F4C0;   // IDirect3DDevice7*
+
+    const DWORD triBuf     = 0x636520;   // D3DTLVERTEX x3 per triangle (0x60)
+    const DWORD triCount   = 0x63F550;
+    const int   kTriMax    = 0x154;
+    const DWORD glyphs     = 0x559200;   // 0x2C each
+    const DWORD glyphCount = 0x559138;   // (word)
+    const int   kGlyphMax  = 1024;
+    const DWORD backBuffer = 0x63F4B4;   // IDirectDrawSurface7*
+    const DWORD deviceUp   = 0x63F51C;
+    const DWORD lockState  = 0x63F528;
+    const DWORD lockBack   = 0x63F52C;
+    const DWORD fmt565     = 0x4F497C;
+
+    const ht::Sig kSigs[] = {
+        { 0x46CFA2, "\x68\xE0\x01\x00\x00", 5 },
+        { 0x46CFA7, "\xBA\x80\x02\x00\x00", 5 },
+        { 0x46CFDF, "\x68\xE0\x01\x00\x00", 5 },
+        { 0x46CFE4, "\x68\x80\x02\x00\x00", 5 },
+        { 0x46CFF8, "\x68\xE0\x01\x00\x00", 5 },
+        { 0x46CFFD, "\xBA\x80\x02\x00\x00", 5 },
+        { 0x46D035, "\x81\x7C\x24\x10\x80\x02\x00\x00", 8 },
+        { 0x46D03F, "\x81\x7C\x24\x0C\xE0\x01\x00\x00", 8 },
+        { 0x46D5B9, "\xC7\x44\x24\x48\x80\x02\x00\x00", 8 },
+        { 0x46D5C1, "\xC7\x44\x24\x44\xE0\x01\x00\x00", 8 },
+        { 0x46D804, "\xC7\x44\x24\x08\x80\x02\x00\x00", 8 },
+        { 0x46D80C, "\xC7\x44\x24\x0C\xE0\x01\x00\x00", 8 },
+        { 0x46D89F, "\x8D\x80\xC0\x64\x63\x00\xC3", 7 },
+        { 0x46CE20, "\xA1\x50\xF5\x63\x00", 5 },
+        { 0x4528AF, "\x83\xC4\x14\xC2\x04\x00", 6 },
+        { 0x44C9C0, "\x83\xEC\x10\x33\xC9", 5 },
+        { 0x44CB1B, "\xE8\xC0\x4B\xFE\xFF", 5 },
+        { 0x44CB20, "\xE8\xAB\x87\xFE\xFF", 5 },
+        { 0x409760, "\xA1\xE0\x63\x4F\x00", 5 },
+        { 0x4513B2, "\xE8\x39\xA4\x02\x00", 5 },
+        { 0x451280, "\x83\xEC\x18\x56\x57", 5 },
+        { 0x450E40, "\x83\xEC\x30\x8B\x54\x24\x38", 7 },
+        { 0x47BB59, "\xE8\x92\xFC\xFF\xFF", 5 },
+        { 0x44CACF, "\xE8\x0C\x07\x00\x00", 5 },       // race draw: call 0x44D1E0 (the sky)
+        { 0x4097B7, "\xD9\x05\xD8\x08\x45\x01", 6 },
+        { 0x4097C2, "\xD8\x0D\xD8\x08\x45\x01", 6 },
+        { 0x41783B, "\x68\x00\x20\x9E\xC3", 5 },
+        { 0x417888, "\x68\x00\x20\x9E\x43", 5 },
+        { 0x417A6B, "\x68\x00\x20\x9E\xC3", 5 },
+        { 0x417AA2, "\x68\x00\x20\x9E\x43", 5 },
+        { 0x4178B9, "\xD8\x0D\x04\xB4\x48\x00", 6 },
+        { 0x417AB2, "\xD8\x0D\x04\xB4\x48\x00", 6 },
+        { 0x46BA40, "\x81\xEC\x80\x00\x00\x00\xA1\x1C\xF5\x63\x00", 11 },
+        { 0x46BB50, "\xA1\x1C\xF5\x63\x00", 5 },
+        { 0x471FC0, "\xE8\x8B\xFF\xFF\xFF", 5 },
+        { 0x4780B1, "\xE8\xEA\x4C\xFF\xFF", 5 },
+        { 0x478040, "\xE8\x0B\xA0\xFF\xFF", 5 },
+        { 0x4513BB, "\x83\xC6\x2C", 3 },       // the glyph loop steps 0x2C
+        { 0x4512DF, "\x83\xC6\x24", 3 },       //   from record + 0x24
+        { 0x451179, "\x8D\x0C\x85\x00\x92\x55\x00", 7 },   // 0x450E40 draws its own glyphs at 0x559200
+    };
+}
+
+// What a triangle is (its tag), and how it is moved.
+enum WsTag : BYTE { kT3D, kTHud, kTMenu, kTLeft, kTCenter, kTRight, kTStretch, kTSky };
+
+static bool  g_wsOn = false;
+static int   g_wsW = 640, g_wsH = 480;
+static float g_wsS = 1.0f;                // 4:3 scale: min(W/640, H/480)
+static float g_wsK = 1.0f;                // how much wider than 4:3: W / (640 s)
+static float g_wsCx = 320.0f, g_wsCy = 240.0f;
+static float g_wsSx = 1.0f, g_wsSy = 1.0f;   // stretched: W/640, H/480
+extern "C" {
+    float g_halfW = 320.5f;               // the half width the glows read
+    float g_markerSpread = 245.0f;        // the markers along the bottom: their spread
+    int   g_wsLayer = kTMenu;             // what is being drawn
+    int   g_wsForce = -1;                 // a tag for the next triangles, -1 = none
+    DWORD g_wsRetSave = 0;                // (stubs that call 0x47B7F0 in between)
+}
+static BYTE g_triTag[0x160];
+static WORD g_glyphStr[ws::kGlyphMax];    // the string a queued glyph belongs to
+static BYTE g_glyphTag[ws::kGlyphMax];    // its anchor
+static WORD g_strSeq = 0, g_strStart = 0;
+static int  g_strDepth = 0;               // inside 0x450E40 (it may draw its glyphs at once)
+
+static inline bool IsD3D() { return reinterpret_cast<int (*)()>(ws::isD3D)() != 0; }
+
+// The anchor of something spanning lo..hi on the 4:3 screen: by the third it's in.
+static inline BYTE AnchorOf(float lo, float hi) {
+    float c = (lo + hi) * 0.5f;
+    return c < 640.0f / 3.0f ? kTLeft : c > 1280.0f / 3.0f ? kTRight : kTCenter;
+}
+
+static bool g_frame3D = false;            // this frame draws the race's 3D (full width)
+static bool g_menuFull = false;           // this frame has a full-width menu picture
+
+// 0x46D850 handed out triangle slot [count - 1].
+extern "C" void WsTagTri() {
+    int n = G<int>(ws::triCount);
+    if (n < 1 || n > (int)sizeof(g_triTag)) return;
+    BYTE tag = (BYTE)(g_wsForce >= 0 ? g_wsForce : g_wsLayer);
+    g_triTag[n - 1] = tag;
+    if (tag == kT3D || tag == kTSky) g_frame3D = true;
+}
+
+static void ClearBars() {
+    if (g_cfg.wsMenus == 2 || !(g_wsK > 1.0001f)) return;
+    void* dev = G<void*>(ws::device);
+    if (!dev || !G<DWORD>(ws::deviceUp) || G<DWORD>(ws::lockState)) return;
+    LONG x0 = (LONG)ceilf(g_wsCx - 320.0f * g_wsS - 0.5f), x1 = (LONG)ceilf(g_wsCx + 320.0f * g_wsS - 0.5f);
+    if (x0 <= 0 && x1 >= g_wsW) return;
+    D3DRECT r[2] = { { 0, 0, x0, g_wsH }, { x1, 0, g_wsW, g_wsH } };
+    typedef HRESULT (__stdcall* ClearFn)(void*, DWORD, const D3DRECT*, DWORD, DWORD, float, DWORD);
+    ClearFn clear = reinterpret_cast<ClearFn>((*reinterpret_cast<void***>(dev))[0x28 / 4]);
+    clear(dev, 2, r, D3DCLEAR_TARGET, 0, 1.0f, 0);
+}
+
+// The frame is about to be shown (0x478040): a menu with a picture across the
+// whole 4:3 screen (copied into the frame, or a quad) over a race drawn behind
+// it (some menus draw a race scene, full width): at 640x480 the picture hid
+// the race, so the bars beside it are cleared to black.
+extern "C" void WsPresent() {
+    if (g_menuFull) ClearBars();
+    g_menuFull = false;
+}
+
+// A frame begins (0x478080, after BeginScene): menus are drawn 4:3 and never
+// clear the screen (at 640x480 their pictures cover it), so the bars beside
+// them would keep whatever was there (a race). Unless the last frame drew a
+// race (full width), they are cleared to black.
+extern "C" void WsFrameBegin() {
+    bool race = g_frame3D;
+    g_frame3D = false;
+    if (!race) ClearBars();
+}
+
+// The triangle buffer is about to be drawn: move every vertex to the screen.
+extern "C" void WsFlush() {
+    int n = G<int>(ws::triCount);
+    if (n > (int)sizeof(g_triTag)) n = sizeof(g_triTag);
+    const float left = g_wsCx - 320.0f * g_wsS * g_wsK, right = g_wsCx + 320.0f * g_wsS * g_wsK;
+    for (int i = 0; i < n; i++) {
+        float* v = reinterpret_cast<float*>(ws::triBuf + i * 0x60);   // x, y at +0, +4; 8 floats a vertex
+        int tag = g_triTag[i];
+        bool stretch = false;
+        switch (tag) {
+        case kT3D:      stretch = !g_cfg.wsFixFOV; tag = kTCenter; break;
+        case kTMenu:
+            stretch = g_cfg.wsMenus == 2; tag = kTCenter;
+            if (!g_menuFull) {                                     // a picture across the whole 4:3 screen?
+                float lo = v[0], hi = v[0];
+                for (int j = 1; j < 3; j++) { float x = v[j * 8]; if (x < lo) lo = x; if (x > hi) hi = x; }
+                if (lo <= 1.0f && hi >= 639.0f) g_menuFull = true;
+            }
+            break;
+        case kTStretch: stretch = true; break;
+        case kTSky:                                                // stretched across, upright as the 3D
+            if (!g_cfg.wsFixFOV) { stretch = true; break; }
+            for (int j = 0; j < 3; j++) {
+                v[j * 8] = g_wsCx + (v[j * 8] - 320.0f) * g_wsS * g_wsK;
+                v[j * 8 + 1] = g_wsCy + (v[j * 8 + 1] - 240.0f) * g_wsS;
+            }
+            continue;
+        default:                                                   // the HUD
+            if (g_cfg.wsHud == 0) stretch = true;
+            else if (g_cfg.wsHud == 2) tag = kTCenter;
+            else if (tag == kTHud) {
+                float lo = v[0], hi = v[0];
+                for (int j = 1; j < 3; j++) { float x = v[j * 8]; if (x < lo) lo = x; if (x > hi) hi = x; }
+                tag = AnchorOf(lo, hi);
+            }
+            break;
+        }
+        for (int j = 0; j < 3; j++) {
+            float& x = v[j * 8]; float& y = v[j * 8 + 1];
+            if (stretch) { x *= g_wsSx; y *= g_wsSy; continue; }
+            if (tag == kTLeft)       x = left + x * g_wsS;
+            else if (tag == kTRight) x = right - (640.0f - x) * g_wsS;
+            else                     x = g_wsCx + (x - 320.0f) * g_wsS;
+            y = g_wsCy + (y - 240.0f) * g_wsS;
+        }
+    }
+}
+
+// The markers for opponents behind: at the edges of the screen, and spread
+// along the bottom, as wide as the screen. Set when the width changes.
+static float g_markerK = 1.0f;
+static void SetMarkers(float k) {
+    if (k == g_markerK) return;
+    g_markerK = k;
+    g_markerSpread = 245.0f * k;
+    float edge = 320.0f * k - 3.75f;                               // (316.25 at 4:3)
+    for (int i = 0; i < 4; i++) {
+        float x = (i & 1) ? edge : -edge;
+        PatchBytes(ws::kMarkerEdges[i] + 1, &x, 4);
+    }
+}
+
+// End of the projection setup 0x452530: widen what it built for the 4:3 screen.
+extern "C" void WsProjFix() {
+    bool on = g_wsOn && g_cfg.wsFixFOV && g_wsK > 1.0001f && IsD3D();
+    float k = on ? g_wsK : 1.0f;
+    g_halfW = 320.5f * k;
+    if (g_wsOn) SetMarkers(k);
+    if (!on) return;
+    float half = 320.0f * k;                                       // the screen's edges on the 4:3 screen
+    G<float>(0x14509A0) = 320.0f - half;                           // clip rectangle: left, right
+    G<float>(0x14509A4) = 320.0f + half;
+    G<float>(0x14509B8) = 321.0f + half;
+    G<float>(0x14509C4) = g_halfW;                                 // half width
+    G<float>(0x14508E4) = g_halfW * g_halfW;
+    float diag = sqrtf(g_halfW * g_halfW + 240.0f * 240.0f);       // half diagonal (pushed as 320.5^2 + 240^2)
+    G<float>(0x14509C8) = diag;
+    G<float>(0x14508E8) = diag * diag;
+    float focal = G<float>(0x14508C8);
+    if (focal > 1e-6f) G<float>(0x1450958) = diag / focal;
+    G<float>(0x1450950) *= k;                                      // tan(h)
+    // the side planes: normals (cos h, 0, sin h) and (-cos h, 0, sin h), in
+    // two sets; the second set's vertical planes use the same angle
+    float c = G<float>(0x1450880), s = G<float>(0x1450888);
+    if (!(c > 1e-6f)) return;
+    float t = s / c * k;
+    float c2 = 1.0f / sqrtf(1.0f + t * t), s2 = t * c2;
+    G<float>(0x1450880) = c2;  G<float>(0x1450888) = s2;
+    G<float>(0x145088C) = -c2; G<float>(0x1450894) = s2;
+    G<float>(0x1450900) = c2;  G<float>(0x1450908) = s2;
+    G<float>(0x145090C) = -c2; G<float>(0x1450914) = s2;
+    G<float>(0x145091C) = c2;  G<float>(0x1450920) = s2;
+    G<float>(0x1450928) = -c2; G<float>(0x145092C) = s2;
+}
+
+// Text: 0x450E40 queues one string's glyphs at [0x559138] onward (or draws
+// them at once through 0x451280); 0x451280 draws a run of glyphs.
+extern "C" void WsStrBegin() {
+    g_strDepth++;
+    g_strStart = G<WORD>(ws::glyphCount);
+    if (++g_strSeq == 0) g_strSeq = 1;
+}
+extern "C" void WsStrEnd() {
+    int end = G<WORD>(ws::glyphCount);
+    for (int i = g_strStart; i < end && i < ws::kGlyphMax; i++) g_glyphStr[i] = g_strSeq;
+    if (g_strDepth > 0) g_strDepth--;
+}
+// Before a run is drawn: each string's anchor, from the extent of its glyphs
+// (record: x +4, width +0xC, scale +0x18).
+extern "C" void WsGlyphPrepass(DWORD recs, int n) {
+    if (recs < ws::glyphs || (recs - ws::glyphs) % 0x2C) return;
+    int i0 = (recs - ws::glyphs) / 0x2C;
+    if (n <= 0 || i0 + n > ws::kGlyphMax) return;
+    bool one = g_strDepth > 0;                                     // drawn by 0x450E40 itself: one string
+    int i = i0;
+    while (i < i0 + n) {
+        int j = i;
+        float lo = 1e9f, hi = -1e9f;
+        while (j < i0 + n && (one || j == i || g_glyphStr[j] == g_glyphStr[i])) {
+            const BYTE* r = reinterpret_cast<const BYTE*>(ws::glyphs + j * 0x2C);
+            float x = *reinterpret_cast<const float*>(r + 4);
+            float w = *reinterpret_cast<const float*>(r + 0xC) * *reinterpret_cast<const float*>(r + 0x18);
+            if (x < lo) lo = x;
+            if (x + w > hi) hi = x + w;
+            j++;
+        }
+        BYTE a = (lo <= hi) ? AnchorOf(lo, hi) : (BYTE)kTCenter;
+        for (int m = i; m < j; m++) g_glyphTag[m] = a;
+        i = j;
+    }
+}
+// A glyph's quad (esi = its record + 0x24): in the HUD, its string's anchor.
+extern "C" void WsGlyphBegin(DWORD esi) {
+    if (g_wsLayer != kTHud) return;
+    DWORD r = esi - 0x24;
+    if (r < ws::glyphs || (r - ws::glyphs) % 0x2C) return;
+    int idx = (r - ws::glyphs) / 0x2C;
+    if (idx < ws::kGlyphMax) g_wsForce = g_glyphTag[idx];
+}
+// The light glows and the sun flare (0x409760, drawn by the HUD) place
+// themselves from the camera object [0x144FA50] (its matrix, and its position
+// at +0x6C), not from the view on the matrix stack. In a blended frame the
+// view is blended (ViewFilter) but the camera isn't, so they'd move at 30 fps:
+// for their draw the camera gets the blended view, and its position is moved
+// by as much as the view's. Widescreen: they are in the world (3D).
+static BYTE  g_camSave[0x78];
+static DWORD g_camSaved = 0;
+static int   g_glowLayer = kTMenu;
+extern "C" void GlowPre() {
+    g_glowLayer = g_wsLayer;
+    g_wsLayer = kT3D;
+    g_camSaved = 0;
+    if (!g_inDraw || !g_blend || !g_viewSaved) return;
+    DWORD cam = G<DWORD>(0x144FA50);
+    if (!cam || IsBadWritePtr(reinterpret_cast<void*>(cam), sizeof(g_camSave))) return;
+    if (memcmp(reinterpret_cast<const void*>(cam), &g_viewExact, sizeof(Mat))) return;   // not the view that was blended
+    const Mat& v = G<Mat>(ht::viewBase);
+    memcpy(g_camSave, reinterpret_cast<const void*>(cam), sizeof(g_camSave));
+    float* pos = reinterpret_cast<float*>(cam + 0x6C);
+    for (int i = 0; i < 3; i++) pos[i] += v.f[21 + i] - g_viewExact.f[21 + i];   // the camera's place: the inverse's translation
+    G<Mat>(cam) = v;
+    g_camSaved = cam;
+}
+extern "C" void GlowPost() {
+    if (g_camSaved) memcpy(reinterpret_cast<void*>(g_camSaved), g_camSave, sizeof(g_camSave));
+    g_camSaved = 0;
+    g_wsLayer = g_glowLayer;
+}
+
+extern "C" void WsFadeBegin() { if (g_wsLayer != kT3D) g_wsForce = kTStretch; }
+extern "C" void WsForceEnd() { g_wsForce = -1; }
+
+// Direct writes to the back buffer (menu images): a 640x480 copy.
+static WORD g_shadow[640 * 480], g_snap[640 * 480];
+static bool g_shadowLocked = false;
+static int  g_colX[8192], g_rowY[8192];   // screen -> 640x480 copy (for the unlock)
+
+static void MenuMap(float& ox, float& oy, float& sx, float& sy) {
+    if (g_cfg.wsMenus == 2) { ox = 0.0f; oy = 0.0f; sx = g_wsSx; sy = g_wsSy; return; }
+    ox = g_wsCx - 320.0f * g_wsS; oy = g_wsCy - 240.0f * g_wsS; sx = sy = g_wsS;
+}
+
+static IDirectDrawSurface7* LockBack(DDSURFACEDESC2& d, DWORD flags) {
+    IDirectDrawSurface7* bb = G<IDirectDrawSurface7*>(ws::backBuffer);
+    if (!bb) return nullptr;
+    memset(&d, 0, sizeof(d)); d.dwSize = sizeof(d);
+    if (FAILED(bb->Lock(nullptr, &d, flags, nullptr))) return nullptr;
+    if (d.ddpfPixelFormat.dwRGBBitCount != 16 || !d.lpSurface) { bb->Unlock(nullptr); return nullptr; }
+    return bb;
+}
+
+// 0x46BA40 (fastcall: ecx = which, edx = &pointer; &pitch, &format on the stack)
+extern "C" int __attribute__((fastcall)) WsLock(int which, void** pptr, int* ppitch, int* pfmt) {
+    if (!G<DWORD>(ws::deviceUp) || !pptr || !ppitch || !pfmt || G<DWORD>(ws::lockState)) return 0;
+    float ox, oy, sx, sy; MenuMap(ox, oy, sx, sy);
+    DDSURFACEDESC2 d;
+    if (IDirectDrawSurface7* bb = LockBack(d, DDLOCK_WAIT | DDLOCK_READONLY)) {
+        int w = (int)d.dwWidth, h = (int)d.dwHeight;
+        for (int y = 0; y < 480; y++) {                            // the frame, at 640x480
+            int ry = (int)(oy + (y + 0.5f) * sy); if (ry < 0) ry = 0; if (ry >= h) ry = h - 1;
+            const WORD* src = reinterpret_cast<const WORD*>(static_cast<const BYTE*>(d.lpSurface) + ry * d.lPitch);
+            WORD* dst = g_shadow + y * 640;
+            for (int x = 0; x < 640; x++) {
+                int rx = (int)(ox + (x + 0.5f) * sx); if (rx < 0) rx = 0; if (rx >= w) rx = w - 1;
+                dst[x] = src[rx];
+            }
+        }
+        bb->Unlock(nullptr);
+    } else {
+        memset(g_shadow, 0, sizeof(g_shadow));
+    }
+    memcpy(g_snap, g_shadow, sizeof(g_snap));
+    *pptr = g_shadow; *ppitch = 640 * 2; *pfmt = G<int>(ws::fmt565);
+    G<DWORD>(ws::lockState) = which ? 2 : 1;
+    G<DWORD>(ws::lockBack) = 1;
+    g_shadowLocked = true;
+    return 1;
+}
+
+// 0x46BB50: the pixels the game changed in the copy, scaled into the frame.
+extern "C" int WsUnlock() {
+    if (!g_shadowLocked) return 0;                                 // not ours: the original unlock
+    g_shadowLocked = false;
+    G<DWORD>(ws::lockState) = 0;
+    float ox, oy, sx, sy; MenuMap(ox, oy, sx, sy);
+    DDSURFACEDESC2 d;
+    IDirectDrawSurface7* bb = LockBack(d, DDLOCK_WAIT | DDLOCK_WRITEONLY);
+    if (!bb) return 1;
+    int w = (int)d.dwWidth, h = (int)d.dwHeight;
+    if (w > 8192) w = 8192;
+    if (h > 8192) h = 8192;
+    int x0 = (int)ceilf(ox - 0.5f), x1 = (int)ceilf(ox + 640.0f * sx - 0.5f);
+    int y0 = (int)ceilf(oy - 0.5f), y1 = (int)ceilf(oy + 480.0f * sy - 0.5f);
+    if (x0 < 0) x0 = 0;
+    if (x1 > w) x1 = w;
+    if (y0 < 0) y0 = 0;
+    if (y1 > h) y1 = h;
+    for (int x = x0; x < x1; x++) { int s = (int)((x + 0.5f - ox) / sx); g_colX[x] = s < 0 ? 0 : s > 639 ? 639 : s; }
+    for (int y = y0; y < y1; y++) { int s = (int)((y + 0.5f - oy) / sy); g_rowY[y] = s < 0 ? 0 : s > 479 ? 479 : s; }
+    for (int y = 0; y < 480 && !g_menuFull; y++)                  // a picture across the whole 4:3 screen?
+        if (g_shadow[y * 640] != g_snap[y * 640])
+            for (int y2 = 0; y2 < 480; y2++)
+                if (g_shadow[y2 * 640 + 639] != g_snap[y2 * 640 + 639]) { g_menuFull = true; break; }
+    for (int y = y0; y < y1; y++) {
+        const WORD* sh = g_shadow + g_rowY[y] * 640;
+        const WORD* sn = g_snap + g_rowY[y] * 640;
+        WORD* dst = reinterpret_cast<WORD*>(static_cast<BYTE*>(d.lpSurface) + y * d.lPitch);
+        for (int x = x0; x < x1; x++) {
+            int c = g_colX[x];
+            if (sh[c] != sn[c]) dst[x] = sh[c];
+        }
+    }
+    bb->Unlock(nullptr);
+    return 1;
+}
+
+extern "C" void WsTagStub();
+extern "C" void WsFlushStub();
+extern "C" void WsProjStub();
+extern "C" void WsRaceStub();
+extern "C" void WsHudStub();
+extern "C" void WsLastStub();
+extern "C" void WsGlowStub();
+extern "C" void WsGlyphQuadStub();
+extern "C" void WsGlyphDrawStub();
+extern "C" void WsStrStub();
+extern "C" void WsFadeStub();
+extern "C" void WsUnlockStub();
+extern "C" void WsBeginStub();
+extern "C" void WsSkyStub();
+extern "C" void WsFlipStub();
+asm(
+    ".text\n"
+    // 0x46D89F: "lea eax, [eax+0x6364C0] / ret" (the end of 0x46D850)
+    ".globl _WsTagStub\n"
+    "_WsTagStub:\n"
+    "    leal 0x6364C0(%eax), %eax\n"
+    "    pushl %eax\n"
+    "    pushl %ecx\n"
+    "    pushl %edx\n"
+    "    call _WsTagTri\n"
+    "    popl %edx\n"
+    "    popl %ecx\n"
+    "    popl %eax\n"
+    "    ret\n"
+    // 0x46CE20: "mov eax, [0x63F550]" (5 bytes)
+    ".globl _WsFlushStub\n"
+    "_WsFlushStub:\n"
+    "    pushal\n"
+    "    call _WsFlush\n"
+    "    popal\n"
+    "    movl 0x63F550, %eax\n"
+    "    pushl $0x46CE25\n"
+    "    ret\n"
+    // 0x4528AF: "add esp, 0x14 / ret 4"
+    ".globl _WsProjStub\n"
+    "_WsProjStub:\n"
+    "    addl $0x14, %esp\n"
+    "    pushal\n"
+    "    call _WsProjFix\n"
+    "    popal\n"
+    "    ret $4\n"
+    // 0x44C9C0: "sub esp, 0x10 / xor ecx, ecx" (the race draw starts: 3D)
+    ".globl _WsRaceStub\n"
+    "_WsRaceStub:\n"
+    "    movl $0, _g_wsLayer\n"            // kT3D
+    "    subl $0x10, %esp\n"
+    "    xorl %ecx, %ecx\n"
+    "    pushl $0x44C9C5\n"
+    "    ret\n"
+    // 0x44CB1B: call 0x4316E0 (the HUD)
+    ".globl _WsHudStub\n"
+    "_WsHudStub:\n"
+    "    movl $1, _g_wsLayer\n"            // kTHud
+    "    movl $0x4316E0, %eax\n"
+    "    call *%eax\n"
+    "    movl $0, _g_wsLayer\n"
+    "    ret\n"
+    // 0x44CB20: call 0x4352D0, the race draw's last call
+    ".globl _WsLastStub\n"
+    "_WsLastStub:\n"
+    "    movl $0x4352D0, %eax\n"
+    "    call *%eax\n"
+    "    movl $2, _g_wsLayer\n"            // kTMenu
+    "    ret\n"
+    // 0x409760: "mov eax, [0x4F63E0]" (5 bytes), plain ret: the light glows
+    ".globl _WsGlowStub\n"
+    "_WsGlowStub:\n"
+    "    pushal\n"
+    "    call _GlowPre\n"
+    "    popal\n"
+    "    call L_glowTramp\n"
+    "    pushal\n"
+    "    call _GlowPost\n"
+    "    popal\n"
+    "    ret\n"
+    "L_glowTramp:\n"
+    "    movl 0x4F63E0, %eax\n"
+    "    pushl $0x409765\n"
+    "    ret\n"
+    // 0x4513B2 / 0x47BB59: call 0x47B7F0 (8 arguments pushed, eax free)
+    ".globl _WsGlyphQuadStub\n"
+    "_WsGlyphQuadStub:\n"
+    "    pushal\n"
+    "    pushl %esi\n"
+    "    call _WsGlyphBegin\n"
+    "    addl $4, %esp\n"
+    "    popal\n"
+    "    jmp L_quadForced\n"
+    ".globl _WsFadeStub\n"
+    "_WsFadeStub:\n"
+    "    pushal\n"
+    "    call _WsFadeBegin\n"
+    "    popal\n"
+    "L_quadForced:\n"
+    "    popl _g_wsRetSave\n"
+    "    movl $0x47B7F0, %eax\n"
+    "    call *%eax\n"                     // (ret 0x20)
+    "    pushl _g_wsRetSave\n"
+    "    pushal\n"
+    "    call _WsForceEnd\n"
+    "    popal\n"
+    "    ret\n"
+    // 0x451280: "sub esp, 0x18 / push esi / push edi" (5 bytes); ecx = records, edx = count
+    ".globl _WsGlyphDrawStub\n"
+    "_WsGlyphDrawStub:\n"
+    "    pushal\n"
+    "    pushl %edx\n"
+    "    pushl %ecx\n"
+    "    call _WsGlyphPrepass\n"
+    "    addl $8, %esp\n"
+    "    popal\n"
+    "    subl $0x18, %esp\n"
+    "    pushl %esi\n"
+    "    pushl %edi\n"
+    "    pushl $0x451285\n"
+    "    ret\n"
+    // 0x450E40: "sub esp, 0x30 / mov edx, [esp+0x38]" (7 bytes); ecx = string, 2 arguments, ret 8
+    ".globl _WsStrStub\n"
+    "_WsStrStub:\n"
+    "    pushal\n"
+    "    call _WsStrBegin\n"
+    "    popal\n"
+    "    pushl 8(%esp)\n"
+    "    pushl 8(%esp)\n"
+    "    call L_strTramp\n"
+    "    pushal\n"
+    "    call _WsStrEnd\n"
+    "    popal\n"
+    "    ret $8\n"
+    "L_strTramp:\n"
+    "    subl $0x30, %esp\n"
+    "    movl 0x38(%esp), %edx\n"
+    "    pushl $0x450E47\n"
+    "    ret\n"
+    // 0x478040: call 0x472050 (the flip; eax free)
+    ".globl _WsFlipStub\n"
+    "_WsFlipStub:\n"
+    "    pushal\n"
+    "    call _WsPresent\n"
+    "    popal\n"
+    "    movl $0x472050, %eax\n"
+    "    jmp *%eax\n"
+    // 0x44CACF: call 0x44D1E0, the race's sky (eax free)
+    ".globl _WsSkyStub\n"
+    "_WsSkyStub:\n"
+    "    movl $7, _g_wsForce\n"           // kTSky
+    "    movl $0x44D1E0, %eax\n"
+    "    call *%eax\n"
+    "    movl $-1, _g_wsForce\n"
+    "    ret\n"
+    // 0x4780B1: call 0x46CDA0 (BeginScene; eax free after it)
+    ".globl _WsBeginStub\n"
+    "_WsBeginStub:\n"
+    "    movl $0x46CDA0, %eax\n"
+    "    call *%eax\n"
+    "    pushal\n"
+    "    call _WsFrameBegin\n"
+    "    popal\n"
+    "    ret\n"
+    // 0x46BB50: "mov eax, [0x63F51C]" (5 bytes), no arguments
+    ".globl _WsUnlockStub\n"
+    "_WsUnlockStub:\n"
+    "    pushal\n"
+    "    call _WsUnlock\n"
+    "    testl %eax, %eax\n"
+    "    popal\n"
+    "    jz L_unlockOrig\n"
+    "    ret\n"
+    "L_unlockOrig:\n"
+    "    movl 0x63F51C, %eax\n"
+    "    pushl $0x46BB55\n"
+    "    ret\n"
+);
+
+static void InstallWidescreen() {
+    if (!g_cfg.widescreen) { Logf("widescreen: off (widescreen=0), 640x480\n"); return; }
+    if (!SigsMatch(ws::kSigs, sizeof(ws::kSigs) / sizeof(ws::kSigs[0]))) { Logf("widescreen: off\n"); return; }
+    int w = g_cfg.wsWidth, h = g_cfg.wsHeight;
+    if (w <= 0 || h <= 0) {
+        DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight) {
+            w = (int)dm.dmPelsWidth; h = (int)dm.dmPelsHeight;
+        } else {
+            w = GetSystemMetrics(SM_CXSCREEN); h = GetSystemMetrics(SM_CYSCREEN);
+        }
+    }
+    if (w < 640 || h < 480 || w > 8192 || h > 8192) {
+        Logf("widescreen: off (%dx%d is outside 640x480 - 8192x8192)\n", w, h);
+        return;
+    }
+    g_wsW = w; g_wsH = h;
+    float sw = w / 640.0f, sh = h / 480.0f;
+    g_wsS = sw < sh ? sw : sh;
+    g_wsK = w / (640.0f * g_wsS);
+    g_wsCx = w * 0.5f; g_wsCy = h * 0.5f;
+    g_wsSx = sw; g_wsSy = sh;
+    bool ok = true;
+    for (const ws::Imm& m : ws::kImm) {
+        DWORD v = m.height ? (DWORD)h : (DWORD)w;
+        ok = ok && PatchBytes(m.addr + m.off, &v, 4);
+    }
+    DWORD halfW = reinterpret_cast<DWORD>(&g_halfW);
+    for (DWORD a : ws::kHalfWReads) ok = ok && PatchBytes(a + 2, &halfW, 4);
+    DWORD spread = reinterpret_cast<DWORD>(&g_markerSpread);
+    for (DWORD a : ws::kMarkerSpread) ok = ok && PatchBytes(a + 2, &spread, 4);
+    ok = ok && PatchJmp(ws::tagSlot, reinterpret_cast<void*>(&WsTagStub), 7)
+            && PatchJmp(ws::flush, reinterpret_cast<void*>(&WsFlushStub), 5)
+            && PatchJmp(ws::projEnd, reinterpret_cast<void*>(&WsProjStub), 6)
+            && PatchJmp(ws::raceDraw, reinterpret_cast<void*>(&WsRaceStub), 5)
+            && PatchCall(ws::callHud, reinterpret_cast<void*>(&WsHudStub), 5)
+            && PatchCall(ws::callLast, reinterpret_cast<void*>(&WsLastStub), 5)
+            && PatchCall(ws::glyphQuad, reinterpret_cast<void*>(&WsGlyphQuadStub), 5)
+            && PatchJmp(ws::glyphDraw, reinterpret_cast<void*>(&WsGlyphDrawStub), 5)
+            && PatchJmp(ws::strQueue, reinterpret_cast<void*>(&WsStrStub), 7)
+            && PatchCall(ws::fadeQuad, reinterpret_cast<void*>(&WsFadeStub), 5)
+            && PatchJmp(ws::lockBB, reinterpret_cast<void*>(&WsLock), 6)
+            && PatchJmp(ws::unlockBB, reinterpret_cast<void*>(&WsUnlockStub), 5)
+            && PatchCall(ws::callBegin, reinterpret_cast<void*>(&WsBeginStub), 5)
+            && PatchCall(ws::callSky, reinterpret_cast<void*>(&WsSkyStub), 5)
+            && PatchCall(ws::callFlip, reinterpret_cast<void*>(&WsFlipStub), 5);
+    if (!ok) { Logf("widescreen: patching failed\n"); return; }
+    g_wsOn = true;
+    static const char* const kHud[] = { "stretched", "4:3 at the screen edges", "4:3 in the middle" };
+    Logf("widescreen: %dx%d (Direct3D renderer), aspect %.3f; 3D %s, HUD %s, menus %s\n",
+         w, h, (double)w / h, g_cfg.wsFixFOV ? "Hor+" : "stretched",
+         kHud[g_cfg.wsHud >= 0 && g_cfg.wsHud <= 2 ? g_cfg.wsHud : 1],
+         g_cfg.wsMenus == 2 ? "stretched" : "4:3 in the middle");
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 static void Install() {
@@ -1117,6 +1886,38 @@ static void Install() {
          g_blendObjects ? "" : ", camera only");
 }
 
+// A crash in the game is logged (the first few), with what the mod was doing.
+static LONG CALLBACK CrashLog(EXCEPTION_POINTERS* e) {
+    static int logged = 0;
+    DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    if (logged >= 3) return EXCEPTION_CONTINUE_SEARCH;
+    logged++;
+    const CONTEXT* c = e->ContextRecord;
+    Logf("crash: exception %08lX at %08lX (address %08lX)\n", code, c->Eip,
+         e->ExceptionRecord->NumberParameters > 1 ? (DWORD)e->ExceptionRecord->ExceptionInformation[1] : 0);
+    Logf("  eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX ebp %08lX esp %08lX\n",
+         c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    const DWORD* sp = reinterpret_cast<const DWORD*>(c->Esp);
+    if (!IsBadReadPtr(sp, 64))
+        Logf("  stack %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\n",
+             sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9], sp[10], sp[11]);
+    Logf("  draw fn %06lX (pending %06lX), tick %lu, in draw %d, shown frame %d, blend %d, pre %d post %d, layer %d\n",
+         G<DWORD>(ht::drawFn), G<DWORD>(ht::pendingDrawFn), G<DWORD>(ht::tickCount), (int)g_inDraw,
+         (int)g_inDisplay, (int)g_blend, (int)g_preValid, (int)g_postValid, g_wsLayer);
+    Logf("  sky: loaded %lu set %lu layers %lu, textures %08lX %08lX %08lX %08lX %08lX %08lX | %08lX %08lX %08lX %08lX %08lX %08lX\n",
+         G<DWORD>(0x558010), G<DWORD>(0x5579C8), G<DWORD>(0x5579D8),
+         G<DWORD>(0x558014), G<DWORD>(0x558018), G<DWORD>(0x55801C), G<DWORD>(0x558020), G<DWORD>(0x558024), G<DWORD>(0x558028),
+         G<DWORD>(0x55802C), G<DWORD>(0x558030), G<DWORD>(0x558034), G<DWORD>(0x558038), G<DWORD>(0x55803C), G<DWORD>(0x558040));
+    if (g_preValid) {
+        const DWORD* pre = reinterpret_cast<const DWORD*>(g_statePre + (0x558014 - 0x557980));
+        Logf("  sky textures saved before the tick's draw: %08lX %08lX %08lX %08lX %08lX %08lX\n",
+             pre[0], pre[1], pre[2], pre[3], pre[4], pre[5]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
     InitDirs();
@@ -1126,7 +1927,13 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         g_log = fopen(path, "w");
     }
     Logf("HTFrameFix v" HTFF_VERSION "\n");
+    if (g_log) AddVectoredExceptionHandler(0, CrashLog);
     if (!CheckSigs()) return TRUE;
     Install();
+    InstallWidescreen();
+    if (g_active || g_wsOn) {
+        if (PatchJmp(ws::glows, reinterpret_cast<void*>(&WsGlowStub), 5))
+            Logf("light glows: %s\n", g_active ? "blended with the camera" : "widescreen only");
+    }
     return TRUE;
 }
