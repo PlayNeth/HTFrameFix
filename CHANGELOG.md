@@ -6,6 +6,19 @@ Works with `Hydro.exe` SHA-1 `745cd3cf9aa0327fb5454a7763ff5f91bed9e3ed`. On any 
 
 ---
 
+## 1.0.1
+
+- **The arcade sounds no longer sound blown out.** With the pack, every sound played at the full level of the PC sound it replaces, and the mix overloaded when several played at once.
+  - `arcadeSoundVolume` (default 70) sets how loud the pack's sound effects and speech are, in percent.
+  - `arcadeMusicVolume` (default 70) does the same for the music while the pack is in use, the arcade tracks and the PC's alike.
+  - 100 is how 1.0.0 sounded.
+- **The sun goes behind the scenery (`sunBehindScenery`, default 1).** The game draws the sun on top of everything, so it showed through cliffs and buildings.
+  - The sun's own sprites are now drawn far away with the depth test on: scenery in front of them hides them, and the sky doesn't.
+  - The flare's rings across the screen are drawn as before.
+  - `0` restores the original.
+- **New settings:** `arcadeSoundVolume`, `arcadeMusicVolume`, `sunBehindScenery`. They are added to an existing `HTFrameFix.ini` the first time the new version runs.
+- **Source:** the code is now split into files under `src/`, one for each area of the mod, each with a header. The build command names `src/*.cpp` as well; see the README.
+
 ## 1.0.0
 
 ### Widescreen

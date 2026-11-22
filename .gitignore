@@ -2,3 +2,4 @@
 *.log
 *.ini
 *.pak
+__pycache__/

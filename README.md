@@ -51,6 +51,7 @@ Delete `HTFrameFix.asi`, and the ASI loader if nothing else uses it. You can als
 - **Everything moves smoothly:** the boats, the camera, the scenery, arrow signs, balloons, the paraglider, booster pickups, the sky, the sun flare and the light glows are all blended between ticks.
 - **The game itself is unchanged:** its logic, physics and timing still run at 30 ticks a second, so races play exactly as before.
 - **Menus stay as they were:** the menus, the pause screen and the options screen keep the original 30 fps.
+- **The sun goes behind the scenery:** cliffs and buildings in front of the sun hide it. In the original it shows through them.
 
 ### Widescreen
 
@@ -81,7 +82,7 @@ The PC version's sounds are the arcade's, brought down to 11 kHz 4-bit ADPCM. Th
 
 What's replaced:
 
-- **Sound effects and speech:** 307 of the game's 425 sound files. Each arcade sound is set to the level of the PC sound it replaces, so the mix stays balanced, and sounds whose pitch the game changes keep the same pitch.
+- **Sound effects and speech:** 307 of the game's 425 sound files. Each arcade sound is set to the level of the PC sound it replaces, and sounds whose pitch the game changes keep the same pitch. They are then played at 70% of that level (`arcadeSoundVolume`): at full level the mix overloads when many play at once.
 - **Engines and drones:** the arcade's 16-bit engine loops (low, middle and high for each boat) and the ambient drones, 44 more sounds. The four secret boats get their own arcade engines back; on the PC they borrowed other boats'.
 - **Music:** 21 of the 34 tracks. The PC tracks are the arcade loops written out back to back to fill 1 or 2 minutes; the arcade loops are played as they are and loop seamlessly. The other 13 are ambient tracks made up of several arcade sounds, so they play the PC's version, resampled.
 
@@ -124,6 +125,9 @@ There are no hotkeys.
 | `wsHud` | `1` | `1` 4:3 HUD at the screen edges, `2` 4:3 HUD in the middle, `0` stretched. |
 | `wsMenus` | `1` | `1` menus 4:3 in the middle, `2` stretched. |
 | `arcadeSound` | `1` | `1` uses `HTArcade.pak` when it's next to the `.asi`; `0` keeps the PC sounds. |
+| `arcadeSoundVolume` | `70` | How loud the pack's sound effects and speech are, in percent of their level in the pack (1 to 100). |
+| `arcadeMusicVolume` | `70` | How loud the music is while the pack is in use, in percent (1 to 100). |
+| `sunBehindScenery` | `1` | `1` cliffs and buildings in front of the sun hide it; `0` the sun shows through them, as in the original. |
 | `trackDifficulty` | `0` | Checkpoint time, 1 (most) to 100 (least); one number or 13 with commas. `0` keeps the game's 40. |
 | `aiDifficulty` | `0` | The other boats, 1 (easiest) to 100 (hardest); one number or 13 with commas. `0` keeps the game's 50. |
 | `arcadeSpeedway` | `0` | `1` races the arcade's Hydro Speedway instead of the PC's. |
@@ -155,11 +159,11 @@ All next to the `.asi`:
 
 ## Building from source
 
-The source is a single file, `HTFrameFix.cpp`, built with MinGW-w64, 32-bit (GCC 13):
+The source is `HTFrameFix.cpp` and the files under `src/`: one `.cpp` for each area of the mod, each with a header (`.h`) for what the other files use. It is built with MinGW-w64, 32-bit (GCC 13), from the repository's folder:
 
 ```
 i686-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wextra -shared -s -static-libgcc -static-libstdc++ \
-  -o HTFrameFix.asi HTFrameFix.cpp -lwinmm
+  -o HTFrameFix.asi HTFrameFix.cpp src/*.cpp -lwinmm
 ```
 
 The code relies on GCC: AT&T inline asm stubs, `__attribute__((fastcall))` and `noinline`, and the `_` prefix of 32-bit Windows C symbols. MSVC would need the asm stubs rewritten.
